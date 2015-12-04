@@ -16,17 +16,16 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/module.h>
-#include <linux/kthread.h>
 #include <linux/mutex.h>
 #include <linux/msm_tsens.h>
 #include <linux/workqueue.h>
-#include <linux/completion.h>
 #include <linux/cpu.h>
 #include <linux/cpufreq.h>
 #include <linux/msm_tsens.h>
 #include <linux/msm_thermal.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
+<<<<<<< HEAD
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <linux/of.h>
@@ -2031,11 +2030,40 @@ static __refdata struct attribute *cc_attrs[] = {
 	&cc_enabled_attr.attr,
 	&cpus_offlined_attr.attr,
 	NULL,
+=======
+#include <mach/cpufreq.h>
+
+unsigned int temp_threshold = 70;
+module_param(temp_threshold, int, 0644);
+
+static struct thermal_info {
+	uint32_t cpuinfo_max_freq;
+	uint32_t limited_max_freq;
+	unsigned int safe_diff;
+	bool throttling;
+	bool pending_change;
+} info = {
+	.cpuinfo_max_freq = LONG_MAX,
+	.limited_max_freq = LONG_MAX,
+	.safe_diff = 5,
+	.throttling = false,
+	.pending_change = false,
 };
 
-static __refdata struct attribute_group cc_attr_group = {
-	.attrs = cc_attrs,
+enum thermal_freqs {
+	FREQ_HELL		= 729600,
+	FREQ_VERY_HOT		= 1036800,
+	FREQ_HOT		= 1267200,
+	FREQ_WARM		= 1497600,
+>>>>>>> 6eb0c7e... msm: thermal: add my simplified thermal driver. Stock thermal-engine-hh goes crazy too soon and too often and offers no way for userland to tweak its parameters
 };
+
+enum threshold_levels {
+	LEVEL_HELL		= 12,
+	LEVEL_VERY_HOT		= 9,
+	LEVEL_HOT		= 5,
+};
+<<<<<<< HEAD
 static __init int msm_thermal_add_cc_nodes(void)
 {
 	struct kobject *module_kobj = NULL;
@@ -2523,32 +2551,41 @@ psm_node_exit:
 	}
 	return rc;
 }
+=======
 
-static int probe_vdd_rstr(struct device_node *node,
-		struct msm_thermal_data *data, struct platform_device *pdev)
+static struct msm_thermal_data msm_thermal_info;
+
+static struct delayed_work check_temp_work;
+
+unsigned short get_threshold(void)
 {
-	int ret = 0;
-	int i = 0;
-	int arr_size;
-	char *key = NULL;
-	struct device_node *child_node = NULL;
+	return temp_threshold;
+}
 
-	rails = NULL;
+static int msm_thermal_cpufreq_callback(struct notifier_block *nfb,
+		unsigned long event, void *data)
+{
+	struct cpufreq_policy *policy = data;
 
-	key = "qcom,vdd-restriction-temp";
-	ret = of_property_read_u32(node, key, &data->vdd_rstr_temp_degC);
-	if (ret)
-		goto read_node_fail;
+	if (event != CPUFREQ_ADJUST && !info.pending_change)
+		return 0;
 
-	key = "qcom,vdd-restriction-temp-hysteresis";
-	ret = of_property_read_u32(node, key, &data->vdd_rstr_temp_hyst_degC);
-	if (ret)
-		goto read_node_fail;
+	cpufreq_verify_within_limits(policy, policy->cpuinfo.min_freq,
+		info.limited_max_freq);
 
-	for_each_child_of_node(node, child_node) {
-		rails_cnt++;
-	}
+	return 0;
+}
 
+static struct notifier_block msm_thermal_cpufreq_notifier = {
+	.notifier_call = msm_thermal_cpufreq_callback,
+};
+>>>>>>> 6eb0c7e... msm: thermal: add my simplified thermal driver. Stock thermal-engine-hh goes crazy too soon and too often and offers no way for userland to tweak its parameters
+
+static void limit_cpu_freqs(uint32_t max_freq)
+{
+	unsigned int cpu;
+
+<<<<<<< HEAD
 	if (rails_cnt == 0)
 		goto read_node_fail;
 	if (rails_cnt >= MAX_RAILS) {
@@ -2584,24 +2621,23 @@ static int probe_vdd_rstr(struct device_node *node,
 				rails[i].levels, rails[i].num_levels);
 		if (ret)
 			goto read_node_fail;
+=======
+	if (info.limited_max_freq == max_freq)
+		return;
+>>>>>>> 6eb0c7e... msm: thermal: add my simplified thermal driver. Stock thermal-engine-hh goes crazy too soon and too often and offers no way for userland to tweak its parameters
 
-		key = "qcom,freq-req";
-		rails[i].freq_req = of_property_read_bool(child_node, key);
-		if (rails[i].freq_req)
-			rails[i].min_level = 0;
-		else {
-			key = "qcom,min-level";
-			ret = of_property_read_u32(child_node, key,
-				&rails[i].min_level);
-			if (ret)
-				goto read_node_fail;
-		}
+	info.limited_max_freq = max_freq;
+	info.pending_change = true;
 
-		rails[i].curr_level = -1;
-		rails[i].reg = NULL;
-		i++;
+	get_online_cpus();
+	for_each_online_cpu(cpu) {
+		cpufreq_update_policy(cpu);
+		pr_info("%s: Setting cpu%d max frequency to %d\n",
+				KBUILD_MODNAME, cpu, info.limited_max_freq);
 	}
+	put_online_cpus();
 
+<<<<<<< HEAD
 	if (rails_cnt) {
 		ret = vdd_restriction_reg_init(pdev);
 		if (ret) {
@@ -2901,14 +2937,21 @@ static int probe_psm(struct device_node *node, struct msm_thermal_data *data,
 		psm_rails_cnt = 0;
 		return -ENOMEM;
 	}
+=======
+	info.pending_change = false;
+}
 
-	for (j = 0; j < psm_rails_cnt; j++) {
-		ret = of_property_read_string_index(node, key, j,
-				&psm_rails[j].name);
-		if (ret)
-			goto read_node_fail;
-	}
+static void check_temp(struct work_struct *work)
+{
+	struct tsens_device tsens_dev;
+	uint32_t freq = 0;
+	long temp = 0;
+>>>>>>> 6eb0c7e... msm: thermal: add my simplified thermal driver. Stock thermal-engine-hh goes crazy too soon and too often and offers no way for userland to tweak its parameters
 
+	tsens_dev.sensor_num = msm_thermal_info.sensor_id;
+	tsens_get_temp(&tsens_dev, &temp);
+
+<<<<<<< HEAD
 	if (psm_rails_cnt) {
 		ret = psm_reg_init(pdev);
 		if (ret) {
@@ -3062,12 +3105,29 @@ static int probe_freq_mitigation(struct device_node *node,
 	ret = of_property_read_u32(node, key, &data->freq_limit);
 	if (ret)
 		goto PROBE_FREQ_EXIT;
+=======
+	if (info.throttling) {
+		if (temp < (temp_threshold - info.safe_diff)) {
+			limit_cpu_freqs(info.cpuinfo_max_freq);
+			info.throttling = false;
+			goto reschedule;
+		}
+	}
 
-	key = "qcom,freq-mitigation-control-mask";
-	ret = of_property_read_u32(node, key, &data->freq_mitig_control_mask);
-	if (ret)
-		goto PROBE_FREQ_EXIT;
+	if (temp >= temp_threshold + LEVEL_HELL)
+		freq = FREQ_HELL;
+	else if (temp >= temp_threshold + LEVEL_VERY_HOT)
+		freq = FREQ_VERY_HOT;
+	else if (temp >= temp_threshold + LEVEL_HOT)
+		freq = FREQ_HOT;
+	else if (temp > temp_threshold)
+		freq = FREQ_WARM;
+>>>>>>> 6eb0c7e... msm: thermal: add my simplified thermal driver. Stock thermal-engine-hh goes crazy too soon and too often and offers no way for userland to tweak its parameters
 
+	if (freq) {
+		limit_cpu_freqs(freq);
+
+<<<<<<< HEAD
 	freq_mitigation_enabled = 1;
 
 PROBE_FREQ_EXIT:
@@ -3078,12 +3138,19 @@ PROBE_FREQ_EXIT:
 		freq_mitigation_enabled = 0;
 	}
 	return ret;
+=======
+		if (!info.throttling)
+			info.throttling = true;
+	}
+
+reschedule:
+	schedule_delayed_work(&check_temp_work, msecs_to_jiffies(250));
+>>>>>>> 6eb0c7e... msm: thermal: add my simplified thermal driver. Stock thermal-engine-hh goes crazy too soon and too often and offers no way for userland to tweak its parameters
 }
 
 static int __devinit msm_thermal_dev_probe(struct platform_device *pdev)
 {
 	int ret = 0;
-	char *key = NULL;
 	struct device_node *node = pdev->dev.of_node;
 	struct msm_thermal_data data;
 
@@ -3094,36 +3161,13 @@ static int __devinit msm_thermal_dev_probe(struct platform_device *pdev)
 		goto fail;
 	}
 
-	key = "qcom,sensor-id";
-	ret = of_property_read_u32(node, key, &data.sensor_id);
+	ret = of_property_read_u32(node, "qcom,sensor-id", &data.sensor_id);
 	if (ret)
-		goto fail;
+		return ret;
 
-	key = "qcom,poll-ms";
-	ret = of_property_read_u32(node, key, &data.poll_ms);
-	if (ret)
-		goto fail;
+	WARN_ON(data.sensor_id >= TSENS_MAX_SENSORS);
 
-	key = "qcom,limit-temp";
-	ret = of_property_read_u32(node, key, &data.limit_temp_degC);
-	if (ret)
-		goto fail;
-
-	key = "qcom,temp-hysteresis";
-	ret = of_property_read_u32(node, key, &data.temp_hysteresis_degC);
-	if (ret)
-		goto fail;
-
-	key = "qcom,freq-step";
-	ret = of_property_read_u32(node, key, &data.bootup_freq_step);
-	if (ret)
-		goto fail;
-
-	key = "qcom,freq-control-mask";
-	ret = of_property_read_u32(node, key, &data.bootup_freq_control_mask);
-
-	ret = probe_cc(node, &data, pdev);
-
+<<<<<<< HEAD
 	ret = probe_freq_mitigation(node, &data, pdev);
 	ret = probe_therm_reset(node, &data, pdev);
 
@@ -3180,12 +3224,22 @@ fail:
 	if (ret)
 		pr_err("Failed reading node=%s, key=%s. err:%d\n",
 			node->full_name, key, ret);
+=======
+        memcpy(&msm_thermal_info, &data, sizeof(struct msm_thermal_data));
+
+        INIT_DELAYED_WORK(&check_temp_work, check_temp);
+        schedule_delayed_work(&check_temp_work, 5);
+
+	cpufreq_register_notifier(&msm_thermal_cpufreq_notifier,
+			CPUFREQ_POLICY_NOTIFIER);
+>>>>>>> 6eb0c7e... msm: thermal: add my simplified thermal driver. Stock thermal-engine-hh goes crazy too soon and too often and offers no way for userland to tweak its parameters
 
 	return ret;
 }
 
-static int msm_thermal_dev_exit(struct platform_device *inp_dev)
+static int msm_thermal_dev_remove(struct platform_device *pdev)
 {
+<<<<<<< HEAD
 	msm_thermal_ioctl_cleanup();
 	if (thresh) {
 		if (vdd_rstr_enabled)
@@ -3193,6 +3247,10 @@ static int msm_thermal_dev_exit(struct platform_device *inp_dev)
 		kfree(thresh);
 		thresh = NULL;
 	}
+=======
+	cpufreq_unregister_notifier(&msm_thermal_cpufreq_notifier,
+                        CPUFREQ_POLICY_NOTIFIER);
+>>>>>>> 6eb0c7e... msm: thermal: add my simplified thermal driver. Stock thermal-engine-hh goes crazy too soon and too often and offers no way for userland to tweak its parameters
 	return 0;
 }
 
@@ -3203,21 +3261,22 @@ static struct of_device_id msm_thermal_match_table[] = {
 
 static struct platform_driver msm_thermal_device_driver = {
 	.probe = msm_thermal_dev_probe,
+	.remove = msm_thermal_dev_remove,
 	.driver = {
 		.name = "msm-thermal",
 		.owner = THIS_MODULE,
 		.of_match_table = msm_thermal_match_table,
 	},
-	.remove = msm_thermal_dev_exit,
 };
 
-int __init msm_thermal_device_init(void)
+static int __init msm_thermal_device_init(void)
 {
 	return platform_driver_register(&msm_thermal_device_driver);
 }
 
-int __init msm_thermal_late_init(void)
+static void __exit msm_thermal_device_exit(void)
 {
+<<<<<<< HEAD
 	if (num_possible_cpus() > 1)
 		msm_thermal_add_cc_nodes();
 	msm_thermal_add_psm_nodes();
@@ -3227,6 +3286,10 @@ int __init msm_thermal_late_init(void)
 
 	interrupt_mode_init();
 	return 0;
+=======
+	platform_driver_unregister(&msm_thermal_device_driver);
+>>>>>>> 6eb0c7e... msm: thermal: add my simplified thermal driver. Stock thermal-engine-hh goes crazy too soon and too often and offers no way for userland to tweak its parameters
 }
-late_initcall(msm_thermal_late_init);
 
+late_initcall(msm_thermal_device_init);
+module_exit(msm_thermal_device_exit);
