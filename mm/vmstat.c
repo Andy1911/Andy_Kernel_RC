@@ -725,9 +725,6 @@ const char * const vmstat_text[] = {
 	"numa_other",
 #endif
 	"nr_anon_transparent_hugepages",
-#ifdef CONFIG_UKSM
-	"nr_uksm_zero_pages",
-#endif
 	"nr_free_cma",
 	"nr_swapcache",
 	"nr_dirty_threshold",
@@ -1167,7 +1164,7 @@ static void __cpuinit start_cpu_timer(int cpu)
 {
 	struct delayed_work *work = &per_cpu(vmstat_work, cpu);
 
-	INIT_DELAYED_WORK_DEFERRABLE(work, vmstat_update);
+	INIT_DEFERRABLE_WORK(work, vmstat_update);
 	schedule_delayed_work_on(cpu, work, __round_jiffies_relative(HZ, cpu));
 }
 

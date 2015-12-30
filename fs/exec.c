@@ -19,7 +19,7 @@
  * current->executable is only used by the procfs.  This allows a dispatch
  * table to check for several different types  of binary formats.  We keep
  * trying until we recognize the file or we run out of supported binary
- * formats.
+ * formats. 
  */
 
 #include <linux/slab.h>
@@ -55,7 +55,6 @@
 #include <linux/pipe_fs_i.h>
 #include <linux/oom.h>
 #include <linux/compat.h>
-#include <linux/ksm.h>
 
 #include <asm/uaccess.h>
 #include <asm/mmu_context.h>
@@ -953,13 +952,6 @@ static int de_thread(struct task_struct *tsk)
 		transfer_pid(leader, tsk, PIDTYPE_SID);
 
 		list_replace_rcu(&leader->tasks, &tsk->tasks);
-		/*
-		 * need to delete leader from adj tree, because it will not be
-		 * group leader (exit_signal = -1) soon. release_task(leader)
-		 * can't delete it.
-		 */
-		delete_from_adj_tree(leader);
-		add_2_adj_tree(tsk);
 		list_replace_init(&leader->sibling, &tsk->sibling);
 
 		tsk->group_leader = tsk;
@@ -1021,6 +1013,40 @@ no_thread_group:
 	return 0;
 }
 
+/*
+ * These functions flushes out all traces of the currently running executable
+ * so that a new one can be started
+ */
+static void flush_old_files(struct files_struct * files)
+{
+	long j = -1;
+	struct fdtable *fdt;
+
+	spin_lock(&files->file_lock);
+	for (;;) {
+		unsigned long set, i;
+
+		j++;
+		i = j * BITS_PER_LONG;
+		fdt = files_fdtable(files);
+		if (i >= fdt->max_fds)
+			break;
+		set = fdt->close_on_exec[j];
+		if (!set)
+			continue;
+		fdt->close_on_exec[j] = 0;
+		spin_unlock(&files->file_lock);
+		for ( ; set ; i++,set >>= 1) {
+			if (set & 1) {
+				sys_close(i);
+			}
+		}
+		spin_lock(&files->file_lock);
+
+	}
+	spin_unlock(&files->file_lock);
+}
+
 char *get_task_comm(char *buf, struct task_struct *tsk)
 {
 	/* buf must be at least sizeof(tsk->comm) in size */
@@ -1030,11 +1056,6 @@ char *get_task_comm(char *buf, struct task_struct *tsk)
 	return buf;
 }
 EXPORT_SYMBOL_GPL(get_task_comm);
-
-/*
- * These functions flushes out all traces of the currently running executable
- * so that a new one can be started
- */
 
 void set_task_comm(struct task_struct *tsk, char *buf)
 {
@@ -1149,9 +1170,9 @@ void setup_new_exec(struct linux_binprm * bprm)
 	   group */
 
 	current->self_exec_id++;
-
+			
 	flush_signal_handlers(current, 0);
-	do_close_on_exec(current->files);
+	flush_old_files(current->files);
 }
 EXPORT_SYMBOL(setup_new_exec);
 
@@ -1318,9 +1339,7 @@ static void bprm_fill_uid(struct linux_binprm *bprm)
 }
 
 /* 
- * Fill the binprm structure from the inode.
- * 
- * Fill the binprm structure from the inode.
+ * Fill the binprm structure from the inode. 
  * Check permissions, then read the first 128 (BINPRM_BUF_SIZE) bytes
  *
  * This may be called multiple times for binary chains (scripts for example).
