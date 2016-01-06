@@ -13,9 +13,9 @@
 #ifndef __SPLASH_H_
 #define __SPLASH_H_
 
-#define SPLASH_IMAGE_WIDTH	113
-#define SPLASH_IMAGE_HEIGHT	124
-#define SPLASH_IMAGE_FORMAT	MDP_BGR_888
+#define SPLASH_IMAGE_WIDTH	320
+#define SPLASH_IMAGE_HEIGHT	480
+#define SPLASH_IMAGE_FORMAT	MDP_RGB_565
 #define SPLASH_IMAGE_BPP	3
 
 char splash_bgr888_image[] = {
