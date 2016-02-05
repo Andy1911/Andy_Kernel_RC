@@ -30,6 +30,7 @@
 #include <mach/socinfo.h>
 #include <linux/mman.h>
 #include <linux/sort.h>
+#include <linux/security.h>
 #include <asm/cacheflush.h>
 
 #include "kgsl.h"
@@ -51,17 +52,17 @@
 
 static int kgsl_pagetable_count = KGSL_PAGETABLE_COUNT;
 
-#ifdef CONFIG_ARM_LPAE
-#define KGSL_DMA_BIT_MASK	DMA_BIT_MASK(64)
-#else
-#define KGSL_DMA_BIT_MASK	DMA_BIT_MASK(32)
-#endif
-
 /*
  * Define an kmem cache for the memobj structures since we allocate and free
  * them so frequently
  */
 static struct kmem_cache *memobjs_cache;
+
+#ifdef CONFIG_ARM_LPAE
+#define KGSL_DMA_BIT_MASK	DMA_BIT_MASK(64)
+#else
+#define KGSL_DMA_BIT_MASK	DMA_BIT_MASK(32)
+#endif
 
 static char *ksgl_mmu_type;
 module_param_named(ptcount, kgsl_pagetable_count, int, 0);
@@ -77,14 +78,8 @@ struct kgsl_dma_buf_meta {
 	struct sg_table *table;
 };
 
-static void kgsl_put_process_private(struct kgsl_device *device,
-			 struct kgsl_process_private *private);
-
 static void kgsl_mem_entry_detach_process(struct kgsl_mem_entry *entry);
 
-static void
-kgsl_put_process_private(struct kgsl_device *device,
-			 struct kgsl_process_private *private);
 /**
  * kgsl_trace_issueibcmds() - Call trace_issueibcmds by proxy
  * device: KGSL device
@@ -422,8 +417,8 @@ kgsl_mem_entry_attach_process(struct kgsl_mem_entry *entry,
 {
 	int ret;
 	struct kgsl_process_private *process = dev_priv->process_priv;
-	
-	ret = kref_get_unless_zero(&process->refcount);
+
+	ret = kgsl_process_private_get(process);
 	if (!ret)
 		return -EBADF;
 
@@ -462,7 +457,7 @@ kgsl_mem_entry_attach_process(struct kgsl_mem_entry *entry,
 	return ret;
 
 err_put_proc_priv:
-	kgsl_put_process_private(dev_priv->device, process);
+	kgsl_process_private_put(process);
 	return ret;
 }
 
@@ -485,7 +480,7 @@ static void kgsl_mem_entry_detach_process(struct kgsl_mem_entry *entry)
 
 	entry->priv->stats[entry->memtype].cur -= entry->memdesc.size;
 	spin_unlock(&entry->priv->mem_lock);
-	kgsl_put_process_private(entry->dev_priv->device, entry->priv);
+	kgsl_process_private_put(entry->priv);
 
 	entry->priv = NULL;
 }
@@ -570,7 +565,7 @@ int kgsl_context_init(struct kgsl_device_private *dev_priv,
 	 * the context is destroyed. This will also prevent the pagetable
 	 * from being destroyed
 	 */
-	if (!kref_get_unless_zero(&dev_priv->process_priv->refcount))
+	if (!kgsl_process_private_get(dev_priv->process_priv))
 		goto fail_free_id;
 	context->device = dev_priv->device;
 	context->dev_priv = dev_priv;
@@ -664,8 +659,7 @@ kgsl_context_destroy(struct kref *kref)
 	}
 	write_unlock(&device->context_lock);
 	kgsl_sync_timeline_destroy(context);
-	kgsl_put_process_private(device,
-				context->proc_priv);
+	kgsl_process_private_put(context->proc_priv);
 
 	device->ftbl->drawctxt_destroy(context);
 }
@@ -907,9 +901,8 @@ static void kgsl_destroy_process_private(struct kref *kref)
 	return;
 }
 
-static void
-kgsl_put_process_private(struct kgsl_device *device,
-			 struct kgsl_process_private *private)
+void
+kgsl_process_private_put(struct kgsl_process_private *private)
 {
 	mutex_lock(&kgsl_driver.process_mutex);
 
@@ -924,13 +917,32 @@ kgsl_put_process_private(struct kgsl_device *device,
 }
 
 /**
- * find_process_private() - Helper function to search for process private
- * @cur_dev_priv: Pointer to device private structure which contains pointers
- * to device and process_private structs.
+ * kgsl_process_private_find() - Find the process associated with the specified
+ * name
+ * @name: pid_t of the process to search for
+ * Return the process struct for the given ID.
+ */
+struct kgsl_process_private *kgsl_process_private_find(pid_t pid)
+{
+	struct kgsl_process_private *p, *private = NULL;
+
+	mutex_lock(&kgsl_driver.process_mutex);
+	list_for_each_entry(p, &kgsl_driver.process_list, list) {
+		if (p->pid == pid) {
+			if (kgsl_process_private_get(p))
+				private = p;
+			break;
+		}
+	}
+	mutex_unlock(&kgsl_driver.process_mutex);
+	return private;
+}
+
+/**
+ * kgsl_process_private_new() - Helper function to search for process private
  * Returns: Pointer to the found/newly created private struct
  */
-static struct kgsl_process_private *
-kgsl_find_process_private(struct kgsl_device_private *cur_dev_priv)
+static struct kgsl_process_private *kgsl_process_private_new(void)
 {
 	struct kgsl_process_private *private;
 
@@ -938,18 +950,16 @@ kgsl_find_process_private(struct kgsl_device_private *cur_dev_priv)
 	mutex_lock(&kgsl_driver.process_mutex);
 	list_for_each_entry(private, &kgsl_driver.process_list, list) {
 		if (private->pid == task_tgid_nr(current)) {
-			kref_get(&private->refcount);
+			if (!kgsl_process_private_get(private))
+				private = NULL;
 			goto done;
 		}
 	}
 
 	/* no existing process private found for this dev_priv, create one */
 	private = kzalloc(sizeof(struct kgsl_process_private), GFP_KERNEL);
-	if (private == NULL) {
-		KGSL_DRV_ERR(cur_dev_priv->device, "kzalloc(%d) failed\n",
-			sizeof(struct kgsl_process_private));
+	if (private == NULL)
 		goto done;
-	}
 
 	kref_init(&private->refcount);
 
@@ -971,11 +981,11 @@ done:
  * NULL if pagetable creation for this process private obj failed.
  */
 static struct kgsl_process_private *
-kgsl_get_process_private(struct kgsl_device_private *cur_dev_priv)
+kgsl_get_process_private(struct kgsl_device *device)
 {
 	struct kgsl_process_private *private;
 
-	private = kgsl_find_process_private(cur_dev_priv);
+	private = kgsl_process_private_new();
 
 	if (!private)
 		return NULL;
@@ -990,15 +1000,15 @@ kgsl_get_process_private(struct kgsl_device_private *cur_dev_priv)
 
 	if ((!private->pagetable) && kgsl_mmu_enabled()) {
 		unsigned long pt_name;
-		struct kgsl_mmu *mmu = &cur_dev_priv->device->mmu;
 
 		pt_name = task_tgid_nr(current);
-		private->pagetable = kgsl_mmu_getpagetable(mmu, pt_name);
+		private->pagetable =
+			kgsl_mmu_getpagetable(&device->mmu, pt_name);
 		if (private->pagetable == NULL)
 			goto error;
 	}
 
-	if (kgsl_process_init_sysfs(cur_dev_priv->device, private))
+	if (kgsl_process_init_sysfs(device, private))
 		goto error;
 	if (kgsl_process_init_debugfs(private))
 		goto error;
@@ -1011,7 +1021,7 @@ done:
 
 error:
 	mutex_unlock(&private->process_private_mutex);
-	kgsl_put_process_private(cur_dev_priv->device, private);
+	kgsl_process_private_put(private);
 	return NULL;
 }
 
@@ -1098,7 +1108,7 @@ static int kgsl_release(struct inode *inodep, struct file *filep)
 
 	kfree(dev_priv);
 
-	kgsl_put_process_private(device, private);
+	kgsl_process_private_put(private);
 
 	pm_runtime_put(device->parentdev);
 	return result;
@@ -1188,7 +1198,7 @@ static int kgsl_open(struct inode *inodep, struct file *filep)
 	 * after the first start so that the global pagetable mappings
 	 * are set up before we create the per-process pagetable.
 	 */
-	dev_priv->process_priv = kgsl_get_process_private(dev_priv);
+	dev_priv->process_priv = kgsl_get_process_private(device);
 	if (dev_priv->process_priv ==  NULL) {
 		result = -ENOMEM;
 		goto err_stop;
@@ -1288,6 +1298,8 @@ kgsl_sharedmem_find(struct kgsl_process_private *private, unsigned int gpuaddr)
  * @private: private data for the process to check.
  * @gpuaddr: start address of the region
  * @size: length of the region.
+ * @collision_entry: Returns pointer to the colliding memory entry,
+ * caller's responsibility to take a refcount on this entry
  *
  * Checks that there are no existing allocations within an address
  * region. This function should be called with processes spin lock
@@ -1295,7 +1307,8 @@ kgsl_sharedmem_find(struct kgsl_process_private *private, unsigned int gpuaddr)
  */
 static int
 kgsl_sharedmem_region_empty(struct kgsl_process_private *private,
-	unsigned int gpuaddr, size_t size)
+	unsigned int gpuaddr, size_t size,
+	struct kgsl_mem_entry **collision_entry)
 {
 	int result = 1;
 	unsigned int gpuaddr_end = gpuaddr + size;
@@ -1327,6 +1340,8 @@ kgsl_sharedmem_region_empty(struct kgsl_process_private *private,
 		else if (memdesc_end <= gpuaddr)
 			node = node->rb_right;
 		else {
+			if (collision_entry)
+				*collision_entry = entry;
 			result = 0;
 			break;
 		}
@@ -3360,6 +3375,9 @@ kgsl_ioctl_sharedmem_flush_cache(struct kgsl_device_private *dev_priv,
 	return ret;
 }
 
+/* The largest allowable alignment for a GPU object is 32MB */
+#define KGSL_MAX_ALIGN (32 * SZ_1M)
+
 /*
  * The common parts of kgsl_ioctl_gpumem_alloc and kgsl_ioctl_gpumem_alloc_id.
  */
@@ -3386,11 +3404,13 @@ _gpumem_alloc(struct kgsl_device_private *dev_priv,
 	/* Cap the alignment bits to the highest number we can handle */
 
 	align = (flags & KGSL_MEMALIGN_MASK) >> KGSL_MEMALIGN_SHIFT;
-	if (align >= 32) {
-		KGSL_CORE_ERR("Alignment too big, restricting to 2^31\n");
+	if (align >= ilog2(KGSL_MAX_ALIGN)) {
+		KGSL_CORE_ERR("Alignment too large; restricting to %dK\n",
+			KGSL_MAX_ALIGN >> 10);
 
 		flags &= ~KGSL_MEMALIGN_MASK;
-		flags |= (31 << KGSL_MEMALIGN_SHIFT) & KGSL_MEMALIGN_MASK;
+		flags |= (ilog2(KGSL_MAX_ALIGN) << KGSL_MEMALIGN_SHIFT) &
+			KGSL_MEMALIGN_MASK;
 	}
 
 	entry = kgsl_mem_entry_create();
@@ -3951,6 +3971,105 @@ mmap_range_valid(unsigned long addr, unsigned long len)
 	return ((ULONG_MAX - addr) > len) && ((addr + len) < TASK_SIZE);
 }
 
+/**
+ * kgsl_check_gpu_addr_collision() - Check if an address range collides with
+ * existing allocations of a process
+ * @private: Pointer to process private
+ * @entry: Memory entry of the memory for which address range is being
+ * considered
+ * @addr: Start address of the address range for which collision is checked
+ * @len: Length of the address range
+ * @gpumap_free_addr: The lowest address from where to look for a free address
+ * range because addresses below this are known to conflict
+ * @flag_top_down: Indicates whether to search for unmapped region in top down
+ * or bottom mode
+ * @align: The alignment requirement of the unmapped region
+ *
+ * Function checks if the given address range collides, and if collision
+ * is found then it keeps incrementing the gpumap_free_addr until it finds
+ * an address that does not collide. This suggested addr can be used by the
+ * caller to check if it's acceptable.
+ */
+static int kgsl_check_gpu_addr_collision(
+				struct kgsl_process_private *private,
+				struct kgsl_mem_entry *entry,
+				unsigned long addr, unsigned long len,
+				unsigned long *gpumap_free_addr,
+				bool flag_top_down,
+				unsigned int align)
+{
+	int ret = -EAGAIN;
+	struct kgsl_mem_entry *collision_entry = NULL;
+	spin_lock(&private->mem_lock);
+	if (kgsl_sharedmem_region_empty(private, addr, len, &collision_entry)) {
+		/*
+		 * We found a free memory map, claim it here with
+		 * memory lock held
+		 */
+		entry->memdesc.gpuaddr = addr;
+		/* This should never fail */
+		ret = kgsl_mem_entry_track_gpuaddr(private, entry);
+		spin_unlock(&private->mem_lock);
+		BUG_ON(ret);
+		/* map cannot be called with lock held */
+		ret = kgsl_mmu_map(private->pagetable,
+					&entry->memdesc);
+		if (ret) {
+			spin_lock(&private->mem_lock);
+			kgsl_mem_entry_untrack_gpuaddr(private, entry);
+			spin_unlock(&private->mem_lock);
+		}
+	} else {
+		trace_kgsl_mem_unmapped_area_collision(entry, addr, len,
+							ret);
+		if (!gpumap_free_addr) {
+			spin_unlock(&private->mem_lock);
+			return ret;
+		}
+		/*
+		 * When checking for a free gap make sure the gap is large
+		 * enough to accomodate alignment
+		 */
+		len += 1 << align;
+
+		/*
+		 * Loop through the gpu map address space to find an unmapped
+		 * region of size len, lopping is done either top down or bottom
+		 * up based on flag_top_down setting
+		 */
+		do {
+			if (!collision_entry) {
+				ret = -ENOENT;
+				break;
+			}
+			if (flag_top_down) {
+				addr = collision_entry->memdesc.gpuaddr - len;
+				if (addr > collision_entry->memdesc.gpuaddr) {
+					ret = -EOVERFLOW;
+					break;
+				}
+			} else {
+				addr = collision_entry->memdesc.gpuaddr +
+					kgsl_memdesc_mmapsize(
+						&collision_entry->memdesc);
+				/* overflow check */
+				if (addr < collision_entry->memdesc.gpuaddr) {
+					ret = -EOVERFLOW;
+					break;
+				}
+			}
+			collision_entry = NULL;
+			if (kgsl_sharedmem_region_empty(private, addr, len,
+							&collision_entry)) {
+				*gpumap_free_addr = addr;
+				break;
+			}
+		} while (1);
+		spin_unlock(&private->mem_lock);
+	}
+	return ret;
+}
+
 static unsigned long
 kgsl_get_unmapped_area(struct file *file, unsigned long addr,
 			unsigned long len, unsigned long pgoff,
@@ -3964,6 +4083,11 @@ kgsl_get_unmapped_area(struct file *file, unsigned long addr,
 	struct kgsl_mem_entry *entry = NULL;
 	unsigned int align;
 	unsigned int retry = 0;
+	struct vm_area_struct *vma;
+	int ret_val;
+	unsigned long gpumap_free_addr = 0;
+	bool flag_top_down = true;
+	struct vm_unmapped_area_info info;
 
 	if (vma_offset == device->memstore.gpuaddr)
 		return get_unmapped_area(NULL, addr, len, pgoff, flags);
@@ -3972,6 +4096,9 @@ kgsl_get_unmapped_area(struct file *file, unsigned long addr,
 	if (ret)
 		return ret;
 
+	ret = arch_mmap_check(addr, len, flags);
+	if (ret)
+		goto put;
 	/*
 	 * If we're not going to use CPU map feature, get an ordinary mapping
 	 * with nothing more to be done.
@@ -3985,6 +4112,17 @@ kgsl_get_unmapped_area(struct file *file, unsigned long addr,
 				"pgoff %lx already mapped to gpuaddr %x\n",
 				pgoff, entry->memdesc.gpuaddr);
 		ret = -EBUSY;
+		goto put;
+	}
+	/* special case handling for MAP_FIXED */
+	if (flags & MAP_FIXED) {
+		ret = get_unmapped_area(NULL, addr, len, pgoff, flags);
+		if (!ret || IS_ERR_VALUE(ret))
+			goto put;
+		ret_val = kgsl_check_gpu_addr_collision(private, entry,
+					addr, len, 0, 0, 0);
+		if (ret_val)
+			ret = ret_val;
 		goto put;
 	}
 
@@ -4001,60 +4139,115 @@ kgsl_get_unmapped_area(struct file *file, unsigned long addr,
 
 	if (!mmap_range_valid(addr, len))
 		addr = 0;
+
+	/*
+	 * first try to see if the suggested address is accepted by the
+	 * system map and our gpu map
+	 */
+	if (addr) {
+		vma = find_vma(current->mm, addr);
+		if (!vma || ((addr + len) <= vma->vm_start)) {
+
+			if (align)
+				ret = ALIGN(addr, (1 << align));
+
+			ret_val = kgsl_check_gpu_addr_collision(private,
+				entry, ret, orig_len, NULL, 0, 0);
+
+			if (!ret_val) {
+				/* success */
+				goto put;
+			} else if (((ret_val < 0) && (ret_val != -EAGAIN))) {
+				ret = ret_val;
+				goto put;
+			}
+		}
+	}
+	addr = current->mm->mmap_base;
+	info.length = orig_len;
+	info.align_mask = ((1 << align) - 1);
+	info.align_offset = 0;
+	/*
+	 * Loop through the address space to find a address region agreeable to
+	 * both system map and gpu map
+	 */
 	do {
-		ret = get_unmapped_area(NULL, addr, len, pgoff, flags);
-		if (IS_ERR_VALUE(ret)) {
+		if (retry) {
 			/*
-			 * If we are really fragmented, there may not be room
-			 * for the alignment padding, so try again without it.
+			 * try the bottom up approach if top down failed
 			 */
-			if (!retry && (ret == (unsigned long)-ENOMEM)
-				&& (align > PAGE_SHIFT)) {
+			if (flag_top_down) {
+				flag_top_down = false;
+				addr = TASK_UNMAPPED_BASE;
+				gpumap_free_addr = 0;
+				ret = 0;
+				retry = 0;
+				continue;
+			}
+			/*
+			 * if we are aleady doing bootom up with
+			 * alignement then try w/o alignment
+			 */
+			if (align) {
 				align = 0;
-				addr = 0;
+				flag_top_down = true;
+				addr = current->mm->mmap_base;
+				gpumap_free_addr = 0;
 				len = orig_len;
+				ret = 0;
+				retry = 0;
+				info.align_mask = 0;
+				continue;
+			}
+			/*
+			 * Out of options future targets may have more address
+			 * bits, for now fail
+			 */
+			break;
+		}
+		if (gpumap_free_addr)
+			addr = gpumap_free_addr;
+		if (flag_top_down) {
+			info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+			info.low_limit = PAGE_SIZE;
+			info.high_limit = addr;
+		} else {
+			info.flags = 0;
+			info.low_limit = addr;
+			info.high_limit = TASK_SIZE;
+		}
+		ret = vm_unmapped_area(&info);
+
+		if (ret == (unsigned long)-ENOMEM) {
+			retry = 1;
+			continue;
+		} else if (!ret || (~PAGE_MASK & ret)) {
+			ret = -EBUSY;
+			retry = 1;
+			continue;
+		} else if (IS_ERR_VALUE(ret)) {
+			break;
+		} else {
+			unsigned long temp = ret;
+			ret = security_file_mmap(NULL, 0, 0, 0, ret, 1);
+			if (ret) {
 				retry = 1;
 				continue;
 			}
+			ret = temp;
+		}
+
+		/* make sure there isn't a GPU only mapping at this address */
+		ret_val = kgsl_check_gpu_addr_collision(private, entry, ret,
+						orig_len, &gpumap_free_addr,
+						flag_top_down, align);
+		if (!ret_val) {
+			/* success */
+			break;
+		} else if ((ret_val < 0) && (ret_val != -EAGAIN)) {
+			ret = ret_val;
 			break;
 		}
-		if (align)
-			ret = ALIGN(ret, (1 << align));
-
-		/*make sure there isn't a GPU only mapping at this address */
-		spin_lock(&private->mem_lock);
-		if (kgsl_sharedmem_region_empty(private, ret, orig_len)) {
-			int ret_val;
-			/*
-			 * We found a free memory map, claim it here with
-			 * memory lock held
-			 */
-			entry->memdesc.gpuaddr = ret;
-			/* This should never fail */
-			ret_val = kgsl_mem_entry_track_gpuaddr(private, entry);
-			spin_unlock(&private->mem_lock);
-			BUG_ON(ret_val);
-			/* map cannot be called with lock held */
-			ret_val = kgsl_mmu_map(private->pagetable,
-						&entry->memdesc);
-			if (ret_val) {
-				spin_lock(&private->mem_lock);
-				kgsl_mem_entry_untrack_gpuaddr(private, entry);
-				spin_unlock(&private->mem_lock);
-				ret = ret_val;
-			}
-			break;
-		}
-		spin_unlock(&private->mem_lock);
-
-		trace_kgsl_mem_unmapped_area_collision(entry, addr, orig_len,
-							ret);
-
-		/*
-		 * If we collided, bump the hint address so that
-		 * get_umapped_area knows to look somewhere else.
-		 */
-		addr = (addr == 0) ? ret + orig_len : addr + orig_len;
 
 		/*
 		 * The addr hint can be set by userspace to be near
@@ -4062,19 +4255,19 @@ kgsl_get_unmapped_area(struct file *file, unsigned long addr,
 		 * the whole address space at least once by wrapping
 		 * back around once.
 		 */
-		if (!retry && !mmap_range_valid(addr, len)) {
-			addr = 0;
+		if (!mmap_range_valid(addr, len) ||
+			!mmap_range_valid(gpumap_free_addr, len)) {
 			retry = 1;
-		} else {
 			ret = -EBUSY;
+			continue;
 		}
-	} while (!(flags & MAP_FIXED) && mmap_range_valid(addr, len));
+	} while (mmap_range_valid(addr, orig_len));
 
+put:
 	if (IS_ERR_VALUE(ret))
 		KGSL_MEM_ERR(device,
 				"pid %d pgoff %lx len %ld failed error %ld\n",
 				private->pid, pgoff, len, ret);
-put:
 	kgsl_mem_entry_put(entry);
 	return ret;
 }

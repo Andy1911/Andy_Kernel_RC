@@ -214,6 +214,13 @@ static int __mdss_mdp_rotator_to_pipe(struct mdss_mdp_rotator_session *rot,
 		struct mdss_mdp_pipe *pipe)
 {
 	int ret;
+	struct mdss_mdp_pipe *rot_pipe = NULL;
+	struct mdss_mdp_ctl *orig_ctl;
+
+	rot_pipe = rot->pipe;
+	orig_ctl = rot_pipe->mixer->ctl;
+	if (orig_ctl->wb_lock)
+		mutex_lock(orig_ctl->wb_lock);
 
 	pipe->flags = rot->flags;
 	pipe->src_fmt = mdss_mdp_get_format_params(rot->format);
@@ -227,12 +234,12 @@ static int __mdss_mdp_rotator_to_pipe(struct mdss_mdp_rotator_session *rot,
 	rot->params_changed = 0;
 
 	ret = mdss_mdp_smp_reserve(pipe);
-	if (ret) {
+	if (ret)
 		pr_debug("unable to mdss_mdp_smp_reserve rot data\n");
-		return ret;
-	}
 
-	return 0;
+	if (orig_ctl->wb_lock)
+		mutex_unlock(orig_ctl->wb_lock);
+	return ret;
 }
 
 static int mdss_mdp_rotator_queue_sub(struct mdss_mdp_rotator_session *rot,
@@ -469,6 +476,7 @@ int mdss_mdp_rotator_setup(struct msm_fb_data_type *mfd,
 		list_add(&rot->list, &mdp5_data->rot_proc_list);
 	} else if (req->id & MDSS_MDP_ROT_SESSION_MASK) {
 		rot = mdss_mdp_rotator_session_get(req->id);
+
 		if (!rot) {
 			pr_err("rotator session=%x not found\n", req->id);
 			ret = -ENODEV;
@@ -552,14 +560,6 @@ int mdss_mdp_rotator_setup(struct msm_fb_data_type *mfd,
 		if (rot && (req->id == MSMFB_NEW_REQUEST))
 			mdss_mdp_rotator_finish(rot);
 	}
-	/*
-	 * overwrite the src format for rotator to dst format
-	 * for use by the user. On subsequent set calls, the
-	 * user is expected to proivde the original src format
-	 */
-	req->src.format = mdss_mdp_get_rotator_dst_format(req->src.format,
-		req->flags & MDP_ROT_90, req->flags & MDP_BWC_EN);
-
 	mutex_unlock(&rotator_lock);
 	return ret;
 }

@@ -1247,7 +1247,7 @@ static void perf_retry_remove(struct remove_event *rep)
 		       event->cpu, up_ret);
 }
 #else
-static void perf_retry_remove(struct remove_event *rep)
+static void perf_retry_remove(struct release_event *rep)
 {
 }
 #endif
@@ -1298,11 +1298,6 @@ retry:
 	 */
 	if (ctx->is_active) {
 		raw_spin_unlock_irq(&ctx->lock);
-		/*
-		 * Reload the task pointer, it might have been changed by
-		 * a concurrent perf_event_context_sched_out().
-		 */
-		task = ctx->task;
 		goto retry;
 	}
 
@@ -1732,6 +1727,11 @@ retry:
 	 */
 	if (ctx->is_active) {
 		raw_spin_unlock_irq(&ctx->lock);
+		/*
+		 * Reload the task pointer, it might have been changed by
+		 * a concurrent perf_event_context_sched_out().
+		 */
+		task = ctx->task;
 		/*
 		 * Reload the task pointer, it might have been changed by
 		 * a concurrent perf_event_context_sched_out().
@@ -3068,6 +3068,16 @@ static void put_event(struct perf_event *event)
 
 static int perf_release(struct inode *inode, struct file *file)
 {
+	struct perf_event *event = file->private_data;
+
+	/*
+	 * Event can be in state OFF because of a constraint check.
+	 * Change to ACTIVE so that it gets cleaned up correctly.
+	 */
+	if ((event->state == PERF_EVENT_STATE_OFF) &&
+		event->attr.constraint_duplicate)
+		event->state = PERF_EVENT_STATE_ACTIVE;
+
 	put_event(file->private_data);
 	return 0;
 }

@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -43,6 +43,10 @@
 #define INIT_UDELAY		200
 #define MAX_UDELAY		2000
 
+#ifdef CONFIG_CPU_FREQ_GOV_ELEMENTALX
+int graphics_boost = 6;
+#endif
+
 struct clk_pair {
 	const char *name;
 	uint map;
@@ -76,7 +80,7 @@ struct clk_pair clks[KGSL_MAX_CLKS] = {
 };
 
 static void kgsl_pwrctrl_clk(struct kgsl_device *device, int state,
-					  int requested_state);
+					int requested_state);
 static void kgsl_pwrctrl_axi(struct kgsl_device *device, int state);
 static void kgsl_pwrctrl_pwrrail(struct kgsl_device *device, int state);
 
@@ -159,8 +163,12 @@ void kgsl_pwrctrl_pwrlevel_change(struct kgsl_device *device,
 
 
 	trace_kgsl_pwrlevel(device, pwr->active_pwrlevel, pwrlevel->gpu_freq);
-}
 
+#ifdef CONFIG_CPU_FREQ_GOV_ELEMENTALX
+        graphics_boost = pwr->active_pwrlevel;
+#endif
+
+}
 EXPORT_SYMBOL(kgsl_pwrctrl_pwrlevel_change);
 
 static int kgsl_pwrctrl_thermal_pwrlevel_store(struct device *dev,
@@ -434,12 +442,19 @@ static int kgsl_pwrctrl_gpuclk_show(struct device *dev,
 				    struct device_attribute *attr,
 				    char *buf)
 {
+	unsigned long freq;
 	struct kgsl_device *device = kgsl_device_from_dev(dev);
 	struct kgsl_pwrctrl *pwr;
 	if (device == NULL)
 		return 0;
 	pwr = &device->pwrctrl;
-	return snprintf(buf, PAGE_SIZE, "%ld\n", kgsl_pwrctrl_active_freq(pwr));
+
+	if (device->state == KGSL_STATE_SLUMBER)
+		freq = pwr->pwrlevels[pwr->num_pwrlevels - 1].gpu_freq;
+	else
+		freq = kgsl_pwrctrl_active_freq(pwr);
+
+	return snprintf(buf, PAGE_SIZE, "%lu\n", freq);
 }
 
 static int kgsl_pwrctrl_idle_timer_store(struct device *dev,
@@ -785,7 +800,7 @@ void kgsl_pwrctrl_busy_time(struct kgsl_device *device, u64 time, u64 busy)
 }
 EXPORT_SYMBOL(kgsl_pwrctrl_busy_time);
 
-static void kgsl_pwrctrl_clk(struct kgsl_device *device, int state,
+void kgsl_pwrctrl_clk(struct kgsl_device *device, int state,
 					  int requested_state)
 {
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
@@ -993,6 +1008,8 @@ int kgsl_pwrctrl_init(struct kgsl_device *device)
 					   gpu_freq) : 0;
 		pwr->pwrlevels[i].bus_freq =
 			pdata->pwrlevel[i].bus_freq;
+		pwr->pwrlevels[i].io_fraction =
+			pdata->pwrlevel[i].io_fraction;
 	}
 	/* Do not set_rate for targets in sync with AXI */
 	if (pwr->pwrlevels[0].gpu_freq > 0)
@@ -1023,8 +1040,7 @@ int kgsl_pwrctrl_init(struct kgsl_device *device)
 					 pwr->pwrlevels[pwr->active_pwrlevel].
 						bus_freq);
 
-	/* Set the CPU latency to 501usec to allow low latency PC modes */
-	pwr->pm_qos_latency = 501;
+	pwr->pm_qos_latency = pdata->pm_qos_latency;
 
 	pm_runtime_enable(device->parentdev);
 
@@ -1303,6 +1319,7 @@ _slumber(struct kgsl_device *device)
 		del_timer_sync(&device->idle_timer);
 		/* make sure power is on to stop the device*/
 		kgsl_pwrctrl_enable(device);
+		kgsl_pwrctrl_irq(device, KGSL_PWRFLAGS_ON);
 		device->ftbl->suspend_context(device);
 		device->ftbl->stop(device);
 		kgsl_pwrscale_sleep(device);
