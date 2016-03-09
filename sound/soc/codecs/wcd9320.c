@@ -3712,11 +3712,7 @@ static int taiko_hphl_dac_event(struct snd_soc_dapm_widget *w,
 						 WCD9XXX_CLSH_EVENT_POST_PA);
 		} else {
 			wcd9xxx_enable_high_perf_mode(codec, &taiko_p->clsh_d,
-<<<<<<< HEAD
-						WCD9XXX_NON_UHQA_MODE,
-=======
 						taiko_p->uhqa_mode,
->>>>>>> 06c969615da0ea82eebb535cfdbe8288c573c0bd
 						WCD9XXX_CLSAB_STATE_HPHL,
 						WCD9XXX_CLSAB_REQ_DISABLE);
 		}
@@ -3770,11 +3766,7 @@ static int taiko_hphr_dac_event(struct snd_soc_dapm_widget *w,
 						 WCD9XXX_CLSH_EVENT_POST_PA);
 		} else {
 			wcd9xxx_enable_high_perf_mode(codec, &taiko_p->clsh_d,
-<<<<<<< HEAD
-						WCD9XXX_NON_UHQA_MODE,
-=======
 						taiko_p->uhqa_mode,
->>>>>>> 06c969615da0ea82eebb535cfdbe8288c573c0bd
 						WCD9XXX_CLSAB_STATE_HPHR,
 						WCD9XXX_CLSAB_REQ_DISABLE);
 		}
@@ -3961,12 +3953,9 @@ static int taiko_hph_pa_event(struct snd_soc_dapm_widget *w,
 		pr_debug("%s: sleep %d us after %s PA disable\n", __func__,
 				pa_settle_time, w->name);
 
-<<<<<<< HEAD
-=======
 		/* Let MBHC module know PA turned off */
 		wcd9xxx_resmgr_notifier_call(&taiko->resmgr, e_post_off);
 
->>>>>>> 06c969615da0ea82eebb535cfdbe8288c573c0bd
 		break;
 	}
 	return 0;
